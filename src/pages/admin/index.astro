@@ -1,0 +1,819 @@
+---
+import "../../styles/global.css";
+import { isValidAdminSession, ADMIN_COOKIE } from "../../lib/admin-auth";
+import { getAdminOrders, getAttentionInfo } from "../../lib/orders";
+import { ORDER_STATUSES, getOrderStatus } from "../../data/order-status";
+import { provedorAtivo } from "../../lib/transportadora";
+const provedor = Boolean(provedorAtivo());
+import type { OrderSummary } from "../../lib/orders";
+import { SITE } from "../../config/site.config";
+import { saudeEmail } from "../../lib/resend";
+import { estadoDosEmails, levantarFalhas } from "../../lib/emails-falhos";
+
+export const prerender = false;
+
+const token = Astro.cookies.get(ADMIN_COOKIE)?.value;
+if (!(await isValidAdminSession(token))) {
+  return Astro.redirect("/admin/login");
+}
+
+const sp = Astro.url.searchParams;
+const pageParam = Math.max(1, Number(sp.get("page")) || 1);
+const q = (sp.get("q") ?? "").trim();
+const statusFilter = sp.get("status") ?? "";
+const group = sp.get("g") ?? "";
+
+const { orders, page, totalPages, totalFiltered, totalAll, stats } = await getAdminOrders({
+  page: pageParam,
+  q,
+  status: statusFilter,
+  group,
+  host: Astro.url.host,
+});
+
+const saude = saudeEmail();
+const [emailPorPedido, falhas] = await Promise.all([
+  estadoDosEmails(orders.map((o) => ({ orderId: o.orderId, status: o.status }))),
+  levantarFalhas().catch(() => []),
+]);
+const TEM_EMAIL = new Set(ORDER_STATUSES.filter((s) => s.email).map((s) => s.id));
+
+const BRL = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
+
+const STATUS_CLASS: Record<string, string> = {
+  pending: "bg-[var(--cream)] text-black/60",
+  paid: "bg-[var(--blush)] text-[var(--wine)]",
+  processing: "bg-sky-100 text-sky-800",
+  shipped: "bg-indigo-100 text-indigo-800",
+  in_transit: "bg-violet-100 text-violet-800",
+  out_for_delivery: "bg-teal-100 text-teal-800",
+  delivered: "bg-emerald-100 text-emerald-800",
+};
+function statusClass(id: string) {
+  return STATUS_CLASS[id] ?? (getOrderStatus(id)?.isProblem ? "bg-red-100 text-red-700" : "bg-blue-100 text-blue-800");
+}
+function statusLabel(id: string) {
+  return getOrderStatus(id)?.label ?? id;
+}
+
+/** Próximo passo do caminho feliz — vira o botão de 1 clique. */
+/* Só as etapas intermediárias têm avanço manual — é o plano B enquanto não
+   houver provedor de rastreio. "Enviado" nasce do código de rastreio real, e
+   entregue/extraviado têm botões próprios, com confirmação. */
+const NEXT_STEP: Record<string, string> = {
+  shipped: "in_transit",
+  in_transit: "out_for_delivery",
+};
+/** Etapas em que o pedido pode receber/corrigir rastreio e ser finalizado. */
+const EM_ANDAMENTO = new Set(["paid", "shipped", "in_transit", "out_for_delivery"]);
+
+function fdate(ts: number | null | undefined) {
+  if (!ts) return "—";
+  return new Date(ts).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short", timeZone: "America/Sao_Paulo" });
+}
+function waLink(telefone?: string) {
+  const digits = (telefone ?? "").replace(/\D/g, "");
+  if (digits.length < 10) return null;
+  return `https://wa.me/${digits.startsWith("55") && digits.length > 11 ? digits : `55${digits}`}`;
+}
+function fullAddress(o: OrderSummary) {
+  const e = o.endereco ?? {};
+  if (e.linha) return [e.linha, e.cep ? `CEP ${e.cep}` : ""].filter(Boolean).join("\n");
+  return [
+    `${e.rua ?? ""}, ${e.numero ?? ""}${e.complemento ? ` — ${e.complemento}` : ""}`,
+    `${e.bairro ?? ""} — ${e.cidade ?? ""}/${e.uf ?? ""}`,
+    `CEP ${e.cep ?? ""}`,
+  ].join("\n");
+}
+function hrefFor(overrides: Record<string, string | number | undefined>) {
+  const p = new URLSearchParams();
+  if (q) p.set("q", q);
+  if (statusFilter) p.set("status", statusFilter);
+  if (group) p.set("g", group);
+  for (const [k, v] of Object.entries(overrides)) {
+    if (v === undefined || v === "") p.delete(k);
+    else p.set(k, String(v));
+  }
+  const s = p.toString();
+  return `/admin${s ? `?${s}` : ""}`;
+}
+
+const rows = orders.map((o) => ({
+  o,
+  next: NEXT_STEP[o.status] ? (getOrderStatus(NEXT_STEP[o.status]) ?? null) : null,
+  wa: waLink(o.cliente?.telefone),
+  address: fullAddress(o),
+  attention: getAttentionInfo(o),
+}));
+
+const cards: Array<{ label: string; value: string; sub?: string; href?: string; active?: boolean; danger?: boolean }> = [
+  { label: "Precisa de você", value: String(stats.atencao), sub: stats.atencao > 0 ? "Ação manual" : "Tudo em ordem", href: "/admin?g=atencao", active: group === "atencao", danger: true },
+  { label: "Aprovadas hoje", value: String(stats.todayCount), sub: BRL.format(stats.todayRevenue) },
+  { label: "Aguardando Pix", value: String(stats.pending), href: "/admin?status=pending", active: statusFilter === "pending" && !q },
+  { label: "Preparando envio", value: String(stats.prep), href: "/admin?g=prep", active: group === "prep" },
+  { label: "Em transporte", value: String(stats.transporte), href: "/admin?g=transporte", active: group === "transporte" },
+  { label: "Entregues", value: String(stats.delivered), href: "/admin?status=delivered", active: statusFilter === "delivered" && !q },
+  { label: "Problemas", value: String(stats.problemas), href: "/admin?g=problemas", active: group === "problemas" },
+];
+
+const hasFilter = Boolean(q || statusFilter || group);
+const GRID_COLS = "2.5rem_8.5rem_1.25fr_1fr_6rem_11rem_12.5rem";
+const GRID = `grid grid-cols-1 md:grid-cols-[${GRID_COLS}] gap-3 md:gap-4`;
+---
+
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Admin — Pedidos {SITE.storeName}</title>
+  </head>
+  <body class="font-sans text-black bg-[var(--cream)] min-h-dvh">
+    <header class="bg-white border-b border-black/10 px-4 sm:px-6 py-4 sticky top-0 z-20 shadow-sm">
+      <div class="max-w-7xl mx-auto flex items-center justify-between gap-3">
+        <div>
+          <h1 class="text-xl sm:text-2xl font-medium text-[var(--wine)]" style="font-weight:800">Pedidos — {SITE.storeName}</h1>
+          <p class="text-xs text-black/60 mt-0.5">
+            {totalAll} pedido{totalAll === 1 ? "" : "s"} · <span class="font-semibold text-[var(--wine)]">{BRL.format(stats.totalRevenue)}</span> aprovados no total
+          </p>
+        </div>
+        <a href="/admin/atendimento" class="text-sm font-semibold text-black/80 hover:text-black border border-black/15 rounded-md px-3 py-2 transition-colors shrink-0">Atendimento e recuperação</a>
+        <button id="logout-btn" class="text-sm text-black/60 hover:text-black border border-black/15 rounded-md px-3 py-2 transition-colors shrink-0">
+          Sair
+        </button>
+      </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto p-4 sm:p-6 flex flex-col gap-5">
+      <!-- E-MAILS: saúde, teste e falhas -->
+      <section class={`rounded-xl border px-4 py-3.5 shadow-sm ${saude.ok && falhas.length === 0 ? "border-emerald-300 bg-emerald-50" : "border-red-300 bg-red-50"}`}>
+        <div class="flex flex-col lg:flex-row lg:items-center gap-3">
+          <div class="flex-1 min-w-0 text-sm">
+            {saude.ok ? (
+              <p class="font-bold text-emerald-800">✉ E-mails configurados — remetente <span class="font-mono font-normal">{saude.from}</span></p>
+            ) : (
+              <p class="font-bold text-red-800">✉ E-mails NÃO estão chegando aos clientes</p>
+            )}
+            {saude.problemas.length > 0 && (
+              <ul class="mt-1 text-[12px] text-red-800 list-disc pl-5">
+                {saude.problemas.map((p) => <li>{p}</li>)}
+              </ul>
+            )}
+            {falhas.length > 0 && (
+              <p class="mt-1 text-[12px] text-red-800">
+                <strong>{falhas.length}</strong> e-mail(s) falharam e ainda podem ser reenviados. Último motivo: <span class="font-mono">{falhas[0].motivo}</span>
+              </p>
+            )}
+            <p class="mt-1 text-[11px] text-black/60">Um e-mail por etapa, uma vez só · o do Pix leva o código e o prazo real da cobrança · falhas são tentadas de novo pelo cron diário.</p>
+          </div>
+          <div class="flex flex-col sm:flex-row gap-2 shrink-0">
+            {falhas.length > 0 && (
+              <button type="button" id="reenviar-falhas" class="bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-xs font-bold uppercase tracking-wide rounded-md px-4 py-2.5">
+                Reenviar {falhas.length} falha(s)
+              </button>
+            )}
+            <form id="email-teste" class="flex gap-1.5">
+              <input type="email" name="para" required placeholder="seu@email.com" class="w-44 rounded-md border border-black/20 bg-white px-2 py-2 text-xs" />
+              <button type="submit" class="bg-[var(--wine)] hover:opacity-90 disabled:opacity-50 text-white text-xs font-bold uppercase tracking-wide rounded-md px-3 py-2">Testar e-mail</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      {statusFilter === "pending" && stats.pending > 0 && (
+        <div class="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3">
+          <p class="text-sm text-amber-900 flex-1">
+            <strong>Lembrete de Pix</strong> — sai só para quem ainda tem o código <u>ativo</u> no banco (esta adquirente dá 30 minutos) e nunca para quem já pagou. Uma vez por pedido.
+          </p>
+          <button type="button" id="lembrete-todos" class="bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-black text-xs font-bold uppercase tracking-wide rounded-md px-4 py-2.5 shrink-0">
+            Lembrar todos os pendentes
+          </button>
+        </div>
+      )}
+      <!-- ALERTA: pedidos precisando de ação manual -->
+      {
+        stats.atencao > 0 && group !== "atencao" && (
+          <div class="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border-2 border-red-500 bg-red-50 px-4 py-3.5 shadow-sm animate-pulse">
+            <a href="/admin?g=atencao" class="group flex items-center gap-3 flex-1 min-w-0">
+              <div class="shrink-0 flex size-9 items-center justify-center rounded-full bg-red-500 text-white text-lg font-bold">
+                {stats.atencao}
+              </div>
+              <div class="flex-1 min-w-0">
+                <p class="text-sm font-bold text-red-800 leading-tight">
+                  {stats.atencao === 1 ? "1 pedido está" : `${stats.atencao} pedidos estão`} esperando você marcar como <span class="underline">entregue</span> ou <span class="underline">problema</span>
+                </p>
+                <p class="text-[12px] text-red-700 mt-0.5">
+                  Passaram do prazo esperado de entrega.
+                  <span class="group-hover:underline">Clique aqui para ver e decidir individualmente</span> →
+                </p>
+              </div>
+            </a>
+            <div class="flex gap-2 shrink-0">
+              <button
+                type="button"
+                data-bulk-mark
+                data-status="delivered"
+                data-scope="all-attention"
+                class="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold uppercase tracking-wide rounded-md px-4 py-2.5 transition-colors"
+              >
+                ✓ Marcar todos como entregues
+              </button>
+              <button
+                type="button"
+                data-bulk-mark
+                data-status="lost"
+                data-scope="all-attention"
+                title="Use se um caminhão inteiro de entregas teve problema"
+                class="bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-xs font-bold uppercase tracking-wide rounded-md px-4 py-2.5 transition-colors"
+              >
+                ⚠ Marcar todos como extraviado
+              </button>
+            </div>
+          </div>
+        )
+      }
+
+      <!-- Automação -->
+      <div class="rounded-lg border border-black/15 bg-white px-4 py-3 text-[13px] leading-relaxed text-black">
+        <strong class="font-semibold">Como cada etapa acontece:</strong>
+        <span class="font-semibold">Pagamento</span> → automático (Korvex) ·
+        <span class="font-semibold">Enviado</span> → quando você registra o código de rastreio REAL ·
+        <span class="font-semibold">Em trânsito / Saiu para entrega</span> → eventos da transportadora{provedor ? "" : " (sem provedor configurado: use o botão manual, com a informação da transportadora em mãos)"} ·
+        <span class="font-semibold">Entregue / Extraviado</span> → <u>só você</u>, com confirmação. Nada é finalizado automaticamente.
+        O cliente recebe um e-mail por etapa, uma única vez.
+      </div>
+
+      <!-- Estatísticas -->
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-2 sm:gap-3">
+        {
+          cards.map((c) => {
+            const dangerActive = c.danger && Number(c.value) > 0;
+            const baseClasses = dangerActive
+              ? `border-red-400 bg-red-50 ${c.active ? "ring-2 ring-red-500" : ""}`
+              : `bg-white ${c.active ? "border-[var(--wine)] ring-1 ring-[var(--wine)]" : "border-black/10"}`;
+            const valueClasses = dangerActive ? "text-red-700" : "text-black";
+            const subClasses = dangerActive ? "text-red-700" : "text-[var(--wine)]";
+            const labelClasses = dangerActive ? "text-red-800" : "text-black/60";
+            const cardClass = `block rounded-xl border px-3 py-2.5 shadow-sm transition-colors ${baseClasses}` +
+              (c.href ? (dangerActive ? " hover:bg-red-100" : " hover:border-[var(--wine)]") : "");
+            const inner = (
+              <>
+                <p class={`text-[11px] uppercase tracking-wide ${labelClasses}`}>{c.label}</p>
+                <p class={`text-xl font-semibold leading-tight ${valueClasses}`}>{c.value}</p>
+                {c.sub && <p class={`text-[11px] font-medium ${subClasses}`}>{c.sub}</p>}
+              </>
+            );
+            return c.href ? <a href={c.href} class={cardClass}>{inner}</a> : <div class={cardClass}>{inner}</div>;
+          })
+        }
+      </div>
+
+      <!-- Filtros -->
+      <form method="get" action="/admin" class="flex flex-col sm:flex-row gap-2">
+        <input
+          type="search"
+          name="q"
+          value={q}
+          placeholder="Buscar por código, nome, e-mail ou telefone…"
+          class="flex-1 rounded-md border border-black/15 bg-white px-3 py-2.5 text-sm text-black focus:outline-none focus:ring-2 focus:ring-[var(--wine)]/40"
+        />
+        <select name="status" class="rounded-md border border-black/15 bg-white px-3 py-2.5 text-sm text-black sm:w-56 focus:outline-none focus:ring-2 focus:ring-[var(--wine)]/40">
+          <option value="">Todos os status</option>
+          {ORDER_STATUSES.map((s) => <option value={s.id} selected={s.id === statusFilter}>{s.label}</option>)}
+        </select>
+        <button type="submit" class="bg-[var(--wine)] hover:opacity-90 text-white text-sm font-semibold rounded-md px-5 py-2.5 transition-colors">
+          Filtrar
+        </button>
+        {hasFilter && (
+          <a href="/admin" class="self-center text-sm text-black/60 hover:text-black px-2 py-2">Limpar</a>
+        )}
+      </form>
+
+      <!-- Barra de ação em lote (visão "Precisa de você") -->
+      {
+        group === "atencao" && totalFiltered > 0 && (
+          <div class="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-red-300 bg-red-50 px-4 py-3">
+            <p class="text-sm text-red-800 flex-1">
+              <strong class="font-semibold">{totalFiltered}</strong> pedido{totalFiltered === 1 ? "" : "s"} passaram do prazo esperado de entrega.
+              Se todos chegaram certinho, confirme tudo de uma vez.
+            </p>
+            <div class="flex gap-2 shrink-0">
+              <button
+                type="button"
+                data-bulk-mark
+                data-status="delivered"
+                data-scope="all-attention"
+                class="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold uppercase tracking-wide rounded-md px-4 py-2.5 transition-colors"
+              >
+                ✓ Marcar todos ({totalFiltered}) como entregues
+              </button>
+              <button
+                type="button"
+                data-bulk-mark
+                data-status="lost"
+                data-scope="all-attention"
+                title="Use se um caminhão inteiro de entregas teve problema"
+                class="bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-xs font-bold uppercase tracking-wide rounded-md px-4 py-2.5 transition-colors"
+              >
+                ⚠ Marcar todos como extraviado
+              </button>
+            </div>
+          </div>
+        )
+      }
+
+      <!-- Lista de pedidos -->
+      <section class="rounded-xl border border-black/10 bg-white shadow-sm overflow-hidden">
+        <div class={`hidden md:grid md:grid-cols-[${GRID_COLS}] gap-4 px-4 py-2.5 border-b border-black/10 bg-[var(--cream)] text-[11px] font-semibold uppercase tracking-wide text-black/60 items-center`}>
+          <input
+            type="checkbox"
+            id="select-all-checkbox"
+            title="Selecionar todos os pedidos desta página"
+            class="size-4 rounded border-black/20 text-[var(--wine)] focus:ring-[var(--wine)]/40 cursor-pointer"
+          />
+          <span>Pedido</span><span>Cliente</span><span>Produto</span><span>Valor</span><span>Status</span><span>Ações</span>
+        </div>
+
+        {rows.length === 0 && (
+          <p class="text-sm text-black/60 text-center py-14">
+            Nenhum pedido encontrado{hasFilter ? " com esses filtros" : " ainda"}.
+          </p>
+        )}
+
+        <div class="divide-y divide-black/10">
+          {
+            rows.map(({ o, next, wa, address, attention }) => (
+              <article class={GRID + " px-4 py-4 md:items-start" + (attention ? " bg-red-50/40 border-l-4 border-red-500 pl-3" : "")}>
+                <!-- Seleção -->
+                <div class="flex md:block items-center gap-2">
+                  {o.status !== "pending" && (
+                    <label class="inline-flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" data-row-checkbox value={o.orderId} class="size-4 rounded border-black/20 text-[var(--wine)] focus:ring-[var(--wine)]/40 cursor-pointer" />
+                      <span class="md:hidden text-xs text-black/60">Selecionar este pedido</span>
+                    </label>
+                  )}
+                </div>
+
+                <!-- Pedido -->
+                <div>
+                  <button
+                    type="button"
+                    data-copy={o.orderId}
+                    title="Copiar código do pedido"
+                    class="group inline-flex items-center gap-1.5 font-mono text-xs font-semibold text-black hover:text-[var(--wine)] transition-colors"
+                  >
+                    {o.orderId}
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="size-3.5 opacity-40 group-hover:opacity-100" aria-hidden="true">
+                      <path d="M4 2a2 2 0 0 0-2 2v7a1 1 0 1 0 2 0V4h6a1 1 0 1 0 0-2H4Z" />
+                      <path d="M6 6a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6Z" />
+                    </svg>
+                  </button>
+                  <p class="text-[11px] text-black/60 mt-1">{fdate(o.createdAt)}</p>
+                </div>
+
+                <!-- Cliente -->
+                <div class="text-sm min-w-0">
+                  <p class="font-medium text-black truncate">{o.cliente?.nome ?? "—"}</p>
+                  {o.cliente?.email && (
+                    <a href={`mailto:${o.cliente.email}`} class="block text-xs text-black/60 truncate hover:text-black">{o.cliente.email}</a>
+                  )}
+                  <div class="flex items-center gap-2 mt-0.5">
+                    {o.cliente?.telefone && <span class="text-xs text-black/60">{o.cliente.telefone}</span>}
+                    {wa && (
+                      <a href={wa} target="_blank" rel="noopener" class="text-[11px] font-semibold text-emerald-700 hover:underline">WhatsApp ↗</a>
+                    )}
+                  </div>
+                  <details class="mt-1">
+                    <summary class="text-[11px] text-[var(--wine)] cursor-pointer select-none">Endereço de entrega</summary>
+                    <div class="mt-1 text-xs text-black/60 whitespace-pre-line leading-relaxed">{address}</div>
+                    <button type="button" data-copy={`${o.cliente?.nome ?? ""}\n${address}`} class="mt-1 text-[11px] font-semibold text-[var(--wine)] hover:underline">
+                      Copiar endereço completo
+                    </button>
+                  </details>
+                </div>
+
+                <!-- Produto -->
+                <div class="text-sm min-w-0">
+                  <p class="text-black leading-snug line-clamp-2">{o.offer?.name ?? "—"}</p>
+                  {o.voltagem && <p class="mt-1"><span class="inline-block rounded-md bg-black text-white text-[11px] font-bold px-2 py-0.5">⚡ {o.voltagem}</span></p>}
+                  {o.offer?.itens && <p class="text-xs text-black/60 mt-0.5">📦 {o.offer.itens}</p>}
+                  <p class="text-xs text-black/60 mt-0.5">{o.shipping?.name ?? "—"}</p>
+                  {o.brinde && <p class="text-xs text-black/60 mt-0.5">🎁 Brinde: {o.brinde}</p>}
+                  {o.bump && <p class="text-xs font-semibold text-[var(--accent)] mt-0.5">➕ Upsell: {o.bump}</p>}
+                </div>
+
+                <!-- Valor -->
+                <div class="text-sm font-semibold text-black tabular-nums">{BRL.format(o.offer?.amount ?? 0)}</div>
+
+                <!-- Status -->
+                <div class="text-sm">
+                  <span class={`inline-block rounded-md px-2 py-1 text-xs font-semibold ${statusClass(o.status)}`}>{statusLabel(o.status)}</span>
+                  <p class="text-[11px] text-black/60 mt-1">desde {fdate(o.statusTimestamps?.[o.status] ?? o.updatedAt ?? o.createdAt)}</p>
+                  {attention && (
+                    <p class="text-[11px] text-red-700 font-semibold mt-1 leading-snug">⚠ {attention.message}</p>
+                  )}
+                  {TEM_EMAIL.has(o.status) && (
+                    emailPorPedido[o.orderId]?.enviado ? (
+                      <p class="text-[11px] text-emerald-700 mt-1">✉ e-mail desta etapa enviado{emailPorPedido[o.orderId]?.lembrete ? " · lembrete enviado" : ""}</p>
+                    ) : emailPorPedido[o.orderId]?.falha ? (
+                      <p class="text-[11px] text-red-700 font-semibold mt-1 leading-snug">✉ e-mail falhou: {emailPorPedido[o.orderId]?.falha}</p>
+                    ) : (
+                      <p class="text-[11px] text-black/50 mt-1">✉ e-mail desta etapa não enviado</p>
+                    )
+                  )}
+                  {o.trackingCode && (
+                    <p class="text-[11px] text-black/60 mt-0.5 font-mono">{o.carrier ? `${o.carrier}: ` : "Rastreio: "}{o.trackingCode}</p>
+                  )}
+                </div>
+
+                <!-- Ações -->
+                <div class="flex flex-col gap-1.5">
+                  {o.status === "pending" && !emailPorPedido[o.orderId]?.lembrete && (
+                    <button type="button" data-lembrete data-order={o.orderId}
+                      class="w-full bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-black text-[11px] font-bold uppercase rounded-md px-3 py-2">
+                      Enviar lembrete do Pix
+                    </button>
+                  )}
+                  {TEM_EMAIL.has(o.status) && o.cliente?.email && (
+                    <button type="button" data-reenviar data-order={o.orderId} data-label={statusLabel(o.status)}
+                      class="w-full border border-black/20 hover:border-black text-black/70 disabled:opacity-50 text-[11px] font-semibold rounded-md px-3 py-1.5">
+                      ✉ Reenviar e-mail de "{statusLabel(o.status)}"
+                    </button>
+                  )}
+                  {EM_ANDAMENTO.has(o.status) && (
+                    <form data-rastreio-form data-order={o.orderId} data-paid={o.status === "paid" ? "1" : ""} class="flex flex-col gap-1">
+                      <input name="trackingCode" required value={o.trackingCode ?? ""} placeholder="Código de rastreio REAL"
+                        class="w-full rounded-md border border-black/20 px-2 py-1.5 text-xs font-mono uppercase focus:outline-none focus:ring-2 focus:ring-[var(--accent)]" />
+                      <input name="carrier" value={o.carrier ?? ""} placeholder="Transportadora (ex.: Correios)"
+                        class="w-full rounded-md border border-black/20 px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-[var(--accent)]" />
+                      <input name="carrierUrl" value={o.carrierUrl ?? ""} placeholder="Link de rastreio (opcional, https://)"
+                        class="w-full rounded-md border border-black/20 px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-[var(--accent)]" />
+                      <button type="submit" class="w-full bg-[var(--accent)] hover:opacity-90 disabled:opacity-50 text-[var(--accent-ink)] text-xs font-extrabold uppercase tracking-wide rounded-md px-3 py-2">
+                        {o.status === "paid" ? "Salvar rastreio → Enviado" : "Salvar rastreio"}
+                      </button>
+                    </form>
+                  )}
+                  {next && (
+                    <button type="button" data-advance data-order={o.orderId} data-status={next.id} data-label={next.label}
+                      class="w-full border border-black/20 hover:border-black text-black/70 text-[11px] font-semibold rounded-md px-3 py-1.5">
+                      Marcar manualmente: {next.label}
+                    </button>
+                  )}
+                  {(EM_ANDAMENTO.has(o.status) || o.status === "delivered" || o.status === "lost") && (
+                    <div class="grid grid-cols-2 gap-1.5 pt-1 border-t border-black/10">
+                      {o.status !== "delivered" && (
+                        <button type="button" data-final data-order={o.orderId} data-status="delivered" data-label="Entregue"
+                          class="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-[11px] font-bold uppercase rounded-md px-2 py-2">✓ Entregue</button>
+                      )}
+                      {o.status !== "lost" && (
+                        <button type="button" data-final data-order={o.orderId} data-status="lost" data-label="Extraviado"
+                          class="bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-[11px] font-bold uppercase rounded-md px-2 py-2">⚠ Extraviado</button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </article>
+            ))
+          }
+        </div>
+      </section>
+
+      <!-- Paginação -->
+      {
+        totalPages > 1 && (
+          <nav class="flex items-center justify-center gap-3 text-sm">
+            <a
+              href={hrefFor({ page: Math.max(1, page - 1) })}
+              class={`px-3 py-2 rounded-md border border-black/15 bg-white ${page <= 1 ? "pointer-events-none opacity-40" : "hover:border-[var(--wine)]"}`}
+            >
+              ← Anterior
+            </a>
+            <span class="text-black/60">Página {page} de {totalPages} · {totalFiltered} pedido{totalFiltered === 1 ? "" : "s"}</span>
+            <a
+              href={hrefFor({ page: Math.min(totalPages, page + 1) })}
+              class={`px-3 py-2 rounded-md border border-black/15 bg-white ${page >= totalPages ? "pointer-events-none opacity-40" : "hover:border-[var(--wine)]"}`}
+            >
+              Próxima →
+            </a>
+          </nav>
+        )
+      }
+    </main>
+
+    <div id="toast" class="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 hidden rounded-lg bg-[var(--wine)] text-white text-sm font-medium px-4 py-2.5 shadow-xl"></div>
+
+    <!-- Barra de ação em lote (seleção manual de pedidos) -->
+    <div id="bulk-toolbar" class="fixed bottom-20 left-1/2 -translate-x-1/2 z-40 hidden flex-wrap items-center justify-center gap-2 sm:gap-3 rounded-xl bg-[var(--wine)] text-white shadow-xl px-4 py-3 max-w-[95vw]">
+      <span id="bulk-count" class="text-sm font-semibold whitespace-nowrap">0 selecionados</span>
+      <button type="button" id="bulk-mark-delivered" class="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold uppercase tracking-wide rounded-md px-3 py-2 transition-colors whitespace-nowrap">
+        ✓ Marcar como entregues
+      </button>
+      <button type="button" id="bulk-mark-lost" class="bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-xs font-bold uppercase tracking-wide rounded-md px-3 py-2 transition-colors whitespace-nowrap">
+        ⚠ Marcar como extraviado
+      </button>
+      <button type="button" id="bulk-clear" class="text-xs text-white/70 hover:text-white underline whitespace-nowrap">
+        Limpar seleção
+      </button>
+    </div>
+
+    <script>
+      const toastEl = document.getElementById("toast")!;
+      let toastTimer: ReturnType<typeof setTimeout> | undefined;
+      function toast(msg: string, isError = false) {
+        toastEl.textContent = msg;
+        toastEl.classList.toggle("bg-red-700", isError);
+        toastEl.classList.toggle("bg-[var(--wine)]", !isError);
+        toastEl.classList.remove("hidden");
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toastEl.classList.add("hidden"), msg.length > 60 ? 7000 : 3200);
+      }
+
+      document.querySelectorAll<HTMLElement>("[data-copy]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText(btn.getAttribute("data-copy") ?? "");
+            toast("Copiado!");
+          } catch {
+            toast("Não foi possível copiar.", true);
+          }
+        });
+      });
+
+      async function setStatus(orderId: string, status: string, el: HTMLButtonElement | HTMLSelectElement) {
+        el.disabled = true;
+        try {
+          const resp = await fetch("/api/admin/pedido", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ orderId, status }),
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "Falha ao salvar.");
+          toast(data.aviso ? `${orderId}: ${data.aviso}` : `${orderId} atualizado ✓`, Boolean(data.aviso && /não saiu/.test(data.aviso)));
+          setTimeout(() => window.location.reload(), 650);
+        } catch (err) {
+          toast(err instanceof Error ? err.message : "Erro inesperado.", true);
+          el.disabled = false;
+        }
+      }
+
+      document.querySelectorAll<HTMLButtonElement>("[data-advance]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          if (!confirm(`Marcar ${btn.dataset.order} como "${btn.dataset.label}"? Faça isso só com a informação da transportadora em mãos — o cliente recebe o e-mail desta etapa.`)) return;
+          setStatus(btn.dataset.order!, btn.dataset.status!, btn);
+        });
+      });
+
+      // Etapa FINAL — sempre manual, sempre com confirmação.
+      document.querySelectorAll<HTMLButtonElement>("[data-final]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const label = btn.dataset.label;
+          if (!confirm(`Confirmar o pedido ${btn.dataset.order} como "${label}"? O cliente recebe o e-mail de "${label}".`)) return;
+          setStatus(btn.dataset.order!, btn.dataset.status!, btn);
+        });
+      });
+
+      // Código de rastreio real → leva o pedido pago a "Enviado".
+      document.querySelectorAll<HTMLFormElement>("form[data-rastreio-form]").forEach((f) => {
+        f.addEventListener("submit", async (ev) => {
+          ev.preventDefault();
+          const btn = f.querySelector("button")!;
+          const fd = new FormData(f);
+          const codigo = String(fd.get("trackingCode") || "").trim();
+          if (!codigo) return;
+          if (f.dataset.paid && !confirm(`Registrar o rastreio ${codigo} e marcar ${f.dataset.order} como ENVIADO? O cliente recebe o e-mail com o código.`)) return;
+          btn.disabled = true;
+          try {
+            const resp = await fetch("/api/admin/pedido", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ orderId: f.dataset.order, trackingCode: codigo, carrier: fd.get("carrier"), carrierUrl: fd.get("carrierUrl") }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || "Falha ao salvar.");
+            toast(data.aviso ? `${f.dataset.order}: ${data.aviso}` : `${f.dataset.order}: rastreio salvo ✓`, Boolean(data.aviso && /não saiu/.test(data.aviso)));
+            setTimeout(() => window.location.reload(), 900);
+          } catch (err) {
+            toast(err instanceof Error ? err.message : "Erro inesperado.", true);
+            btn.disabled = false;
+          }
+        });
+      });
+
+      document.querySelectorAll<HTMLButtonElement>("[data-status-btn]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const label = btn.dataset.label ?? "problema";
+          if (!confirm(`Marcar como "${label}"? O cliente pode receber um e-mail de aviso sobre isso.`)) return;
+          setStatus(btn.dataset.order!, btn.dataset.status!, btn);
+        });
+      });
+
+      document.querySelectorAll<HTMLSelectElement>("select[data-status-select]").forEach((sel) => {
+        sel.addEventListener("change", () => {
+          const v = sel.value;
+          if (!v) return;
+          const opt = sel.selectedOptions[0];
+          const label = opt?.textContent?.trim() ?? v;
+          if (opt?.dataset.problem === "1" && !confirm(`Marcar como "${label}"? O cliente pode receber um e-mail de aviso sobre isso.`)) {
+            sel.value = "";
+            return;
+          }
+          setStatus(sel.dataset.order!, v, sel);
+        });
+      });
+
+      const BULK_DONE_LABEL: Record<string, string> = { delivered: "marcados como entregues", lost: "marcados como extraviados" };
+
+      /** Chama /api/admin/pedidos-lote e trata sucesso/erro de forma uniforme (usado pelos botões de "todos" e de seleção manual). */
+      async function postBulk(payload: Record<string, unknown>, status: string, btn: HTMLButtonElement) {
+        btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = "Atualizando…";
+        try {
+          const resp = await fetch("/api/admin/pedidos-lote", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "Falha ao salvar.");
+          const failedCount = Array.isArray(data.failed) ? data.failed.length : 0;
+          toast(failedCount > 0 ? `${data.updated} atualizados, ${failedCount} falharam` : `${data.updated} pedidos ${BULK_DONE_LABEL[status] ?? "atualizados"} ✓`);
+          setTimeout(() => window.location.reload(), 800);
+        } catch (err) {
+          toast(err instanceof Error ? err.message : "Erro inesperado.", true);
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }
+      }
+
+      const BULK_CONFIRM: Record<string, string> = {
+        delivered: "Marcar TODOS os pedidos que precisam de ação como entregues? Cada cliente recebe o e-mail de confirmação. Se algum desses pedidos teve problema (extravio, roubo etc.), desmarque-o individualmente depois em vez de usar esta opção.",
+        lost: "Marcar TODOS os pedidos que precisam de ação como extraviados? Use isso só se um caminhão/leva inteira de entregas teve problema — cada cliente recebe um e-mail avisando sobre o extravio.",
+      };
+
+      document.querySelectorAll<HTMLButtonElement>("[data-bulk-mark]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const status = btn.dataset.status!;
+          const scope = btn.dataset.scope;
+          if (!confirm(BULK_CONFIRM[status] ?? `Marcar TODOS os pedidos que precisam de ação como "${status}"?`)) return;
+          postBulk({ status, scope }, status, btn);
+        });
+      });
+
+      // ===== Seleção manual de pedidos (checkboxes) =====
+      const rowCheckboxes = Array.from(document.querySelectorAll<HTMLInputElement>("[data-row-checkbox]"));
+      const selectAllCheckbox = document.getElementById("select-all-checkbox") as HTMLInputElement | null;
+      const bulkToolbar = document.getElementById("bulk-toolbar")!;
+      const bulkCountEl = document.getElementById("bulk-count")!;
+      const selectedOrders = new Set<string>();
+
+      function refreshBulkToolbar() {
+        bulkCountEl.textContent = `${selectedOrders.size} selecionado${selectedOrders.size === 1 ? "" : "s"}`;
+        bulkToolbar.classList.toggle("hidden", selectedOrders.size === 0);
+        bulkToolbar.classList.toggle("flex", selectedOrders.size > 0);
+        if (selectAllCheckbox) {
+          const checkedCount = rowCheckboxes.filter((cb) => cb.checked).length;
+          selectAllCheckbox.checked = rowCheckboxes.length > 0 && checkedCount === rowCheckboxes.length;
+          selectAllCheckbox.indeterminate = checkedCount > 0 && checkedCount < rowCheckboxes.length;
+        }
+      }
+
+      rowCheckboxes.forEach((cb) => {
+        cb.addEventListener("change", () => {
+          if (cb.checked) selectedOrders.add(cb.value);
+          else selectedOrders.delete(cb.value);
+          refreshBulkToolbar();
+        });
+      });
+
+      selectAllCheckbox?.addEventListener("change", () => {
+        rowCheckboxes.forEach((cb) => {
+          cb.checked = selectAllCheckbox.checked;
+          if (cb.checked) selectedOrders.add(cb.value);
+          else selectedOrders.delete(cb.value);
+        });
+        refreshBulkToolbar();
+      });
+
+      document.getElementById("bulk-clear")?.addEventListener("click", () => {
+        selectedOrders.clear();
+        rowCheckboxes.forEach((cb) => (cb.checked = false));
+        refreshBulkToolbar();
+      });
+
+      document.getElementById("bulk-mark-delivered")?.addEventListener("click", (e) => {
+        const n = selectedOrders.size;
+        if (n === 0) return;
+        if (!confirm(`Marcar ${n} pedido${n === 1 ? "" : "s"} selecionado${n === 1 ? "" : "s"} como entregue${n === 1 ? "" : "s"}? Cada cliente recebe o e-mail de confirmação.`)) return;
+        postBulk({ status: "delivered", orderIds: Array.from(selectedOrders) }, "delivered", e.currentTarget as HTMLButtonElement);
+      });
+
+      document.getElementById("bulk-mark-lost")?.addEventListener("click", (e) => {
+        const n = selectedOrders.size;
+        if (n === 0) return;
+        if (!confirm(`Marcar ${n} pedido${n === 1 ? "" : "s"} selecionado${n === 1 ? "" : "s"} como extraviado${n === 1 ? "" : "s"}? Cada cliente recebe um e-mail avisando sobre o problema.`)) return;
+        postBulk({ status: "lost", orderIds: Array.from(selectedOrders) }, "lost", e.currentTarget as HTMLButtonElement);
+      });
+
+      async function postJson(url: string, body: unknown) {
+        const resp = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || "Falha.");
+        return data;
+      }
+
+      document.getElementById("email-teste")?.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const f = ev.currentTarget as HTMLFormElement;
+        const btn = f.querySelector("button")!;
+        const para = String(new FormData(f).get("para") || "").trim();
+        btn.disabled = true;
+        try {
+          await postJson("/api/admin/email", { acao: "teste", para });
+          toast(`Teste enviado para ${para} — confira a caixa de entrada e o spam.`);
+        } catch (err) {
+          toast(err instanceof Error ? err.message : "Erro inesperado.", true);
+        }
+        btn.disabled = false;
+      });
+
+      document.getElementById("reenviar-falhas")?.addEventListener("click", async (e) => {
+        const btn = e.currentTarget as HTMLButtonElement;
+        if (!confirm("Reenviar os e-mails que falharam? Só sai para pedido que continua na mesma etapa.")) return;
+        btn.disabled = true;
+        btn.textContent = "Reenviando…";
+        try {
+          const d = await postJson("/api/admin/email", { acao: "reenviar-falhas" });
+          toast(`${d.enviado} enviados · ${d.pulado} pulados · ${d.erro} falharam${d.motivo ? " — " + d.motivo : ""}`, d.erro > 0);
+          setTimeout(() => window.location.reload(), 2500);
+        } catch (err) {
+          toast(err instanceof Error ? err.message : "Erro inesperado.", true);
+          btn.disabled = false;
+        }
+      });
+
+      document.querySelectorAll<HTMLButtonElement>("[data-reenviar]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          if (!confirm(`Reenviar ao cliente o e-mail de "${btn.dataset.label}" do pedido ${btn.dataset.order}?`)) return;
+          btn.disabled = true;
+          try {
+            await postJson("/api/admin/email", { acao: "reenviar", orderId: btn.dataset.order });
+            toast(`${btn.dataset.order}: e-mail reenviado ✓`);
+            setTimeout(() => window.location.reload(), 900);
+          } catch (err) {
+            toast(err instanceof Error ? err.message : "Erro inesperado.", true);
+            btn.disabled = false;
+          }
+        });
+      });
+
+      function resumoLembrete(d: any) {
+        const partes = [`${d.enviado} enviado(s)`];
+        if (d.expirado) partes.push(`${d.expirado} com código já expirado`);
+        if (d["ja-pago"]) partes.push(`${d["ja-pago"]} JÁ PAGO(S) no banco — confira na Korvex: ${d.jaPagos.join(", ")}`);
+        if (d["nao-verificado"]) partes.push(`${d["nao-verificado"]} sem conferência (tente de novo)`);
+        if (d.erro) partes.push(`${d.erro} falharam${d.motivo ? " — " + d.motivo : ""}`);
+        if (d.restantes) partes.push(`faltam ${d.restantes}: clique de novo`);
+        return partes.join(" · ");
+      }
+
+      document.querySelectorAll<HTMLButtonElement>("[data-lembrete]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          if (!confirm(`Enviar o lembrete do Pix para o pedido ${btn.dataset.order}? Só sai se o código ainda estiver ativo no banco.`)) return;
+          btn.disabled = true;
+          try {
+            const d = await postJson("/api/admin/lembrete", { orderIds: [btn.dataset.order] });
+            toast(resumoLembrete(d), d.enviado === 0);
+            setTimeout(() => window.location.reload(), 3000);
+          } catch (err) {
+            toast(err instanceof Error ? err.message : "Erro inesperado.", true);
+            btn.disabled = false;
+          }
+        });
+      });
+
+      document.getElementById("lembrete-todos")?.addEventListener("click", async (e) => {
+        const btn = e.currentTarget as HTMLButtonElement;
+        if (!confirm("Enviar o lembrete para todos os pendentes que ainda não receberam? Cada um é conferido no banco antes: quem pagou ou tem código vencido não recebe.")) return;
+        btn.disabled = true;
+        btn.textContent = "Conferindo e enviando…";
+        try {
+          const d = await postJson("/api/admin/lembrete", { scope: "all-pending" });
+          toast(resumoLembrete(d), d.enviado === 0);
+          setTimeout(() => window.location.reload(), 4000);
+        } catch (err) {
+          toast(err instanceof Error ? err.message : "Erro inesperado.", true);
+          btn.disabled = false;
+          btn.textContent = "Lembrar todos os pendentes";
+        }
+      });
+
+      document.getElementById("logout-btn")?.addEventListener("click", async () => {
+        await fetch("/api/admin/logout", { method: "POST" });
+        window.location.href = "/admin/login";
+      });
+    </script>
+  </body>
+</html>

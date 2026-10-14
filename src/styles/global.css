@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+@import "@fontsource/inter/800.css";
+
+/* Identidade da loja — use as mesmas cores da LP (config cores: t1, rs, pp).
+   Os nomes antigos do template (--wine, --cream, --blush) ficam como ALIAS
+   porque o painel /admin os usa em dezenas de classes. */
+:root {
+  --ink: #2a1220;
+  --paper: #fffbfc;
+  --accent: #8c2456;
+  --accent-ink: #ffffff;
+  /* Versão clara do acento, só sobre o fundo escuro do cabeçalho. */
+  --accent-on-dark: #f4b6cf;
+
+  --wine: var(--ink);
+  --wine-foreground: #ffffff;
+  --cream: var(--paper);
+  --blush: #fbeef4;
+}
+
+@theme {
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}

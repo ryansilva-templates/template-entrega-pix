@@ -1,0 +1,149 @@
+---
+import "../styles/global.css";
+import { SITE } from "../config/site.config";
+
+export const prerender = false;
+
+const codigo = (Astro.url.searchParams.get("codigo") ?? "").trim().toUpperCase();
+const t = Astro.url.searchParams.get("t") ?? "";
+---
+
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <meta name="theme-color" content="#15233F" />
+    <title>Rastrear pedido | {SITE.storeName}</title>
+  </head>
+  <body class="font-sans text-[var(--ink)] bg-[var(--paper)] min-h-dvh flex flex-col">
+    <header class="bg-[var(--ink)] border-b-4 border-[var(--accent)]">
+      <div class="max-w-2xl mx-auto px-4 py-4 flex items-center justify-between">
+        <a href={SITE.storeUrl} class="text-white text-xl font-extrabold tracking-[0.12em] uppercase">{SITE.storeName}<span class="text-[var(--accent-on-dark)]">.</span></a>
+        <span class="text-xs text-white/70">Acompanhar pedido</span>
+      </div>
+    </header>
+
+    <main class="flex-1 max-w-2xl w-full mx-auto px-4 py-8">
+      <!-- RESULTADO (preenchido pelo script) -->
+      <section id="resultado" class="hidden" aria-live="polite">
+        <div class="bg-white rounded-lg border border-black/10 p-5">
+          <p class="text-xs uppercase tracking-wider text-black/55">Pedido</p>
+          <p class="text-lg font-bold font-mono" data-f="orderId"></p>
+          <p class="text-sm text-black/65 mt-1" data-f="produto"></p>
+
+          <div class="mt-4 rounded-md bg-[var(--paper)] p-4">
+            <p class="text-xs uppercase tracking-wider text-black/55">Status atual</p>
+            <p class="text-xl font-extrabold mt-0.5" data-f="atual"></p>
+            <p class="text-sm text-black/65 mt-1" data-f="proximo"></p>
+            <p class="text-xs text-black/50 mt-2" data-f="ultima"></p>
+          </div>
+
+          <div data-f="problema" class="hidden mt-4 rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-800"></div>
+
+          <div data-f="rastreio" class="hidden mt-4 text-sm"></div>
+        </div>
+
+        <ol data-f="passos" class="mt-6 relative border-l-2 border-black/10 ml-3"></ol>
+
+        <p class="text-xs text-black/50 mt-6">Dúvidas sobre o pedido? Responda qualquer e-mail que enviamos sobre ele.</p>
+      </section>
+
+      <!-- FORMULÁRIO (quando não veio pelo link do e-mail) -->
+      <section id="form-wrap" class={codigo && t ? "hidden" : ""}>
+        <h1 class="text-2xl font-extrabold">Rastrear pedido</h1>
+        <p class="text-sm text-black/60 mt-1">Digite o código do pedido e o e-mail usado na compra.</p>
+        <form id="rastreio-form" class="mt-5 bg-white rounded-lg border border-black/10 p-5 flex flex-col gap-3">
+          <label class="text-sm">
+            <span class="block text-black/60 mb-1">Código do pedido</span>
+            <input required name="orderId" type="text" placeholder="AB-XXXXXXXXXXXXX" value={codigo}
+              class="w-full rounded-md border border-black/20 px-3 py-3 uppercase font-mono focus:outline-none focus:ring-2 focus:ring-[var(--accent)]" />
+          </label>
+          <label class="text-sm">
+            <span class="block text-black/60 mb-1">E-mail usado na compra</span>
+            <input required name="email" type="email" autocomplete="email"
+              class="w-full rounded-md border border-black/20 px-3 py-3 focus:outline-none focus:ring-2 focus:ring-[var(--accent)]" />
+          </label>
+          <p data-erro class="hidden text-sm text-red-700"></p>
+          <button type="submit" class="bg-[var(--accent)] text-[var(--accent-ink)] font-extrabold uppercase tracking-wide rounded-md py-3.5 disabled:opacity-60">Ver meu pedido</button>
+        </form>
+      </section>
+
+      <p id="carregando" class={codigo && t ? "text-sm text-black/60" : "hidden"}>Carregando seu pedido…</p>
+    </main>
+
+    <script define:vars={{ codigo, t }}>
+      const $ = (s, r = document) => r.querySelector(s);
+      const fmt = (ms) => ms ? new Date(ms).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short", timeZone: "America/Sao_Paulo" }) : "";
+      const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+      function mostrar(d) {
+        const r = $("#resultado");
+        $('[data-f="orderId"]', r).textContent = d.orderId;
+        $('[data-f="produto"]', r).textContent = d.produto ? (d.quantidade > 1 ? d.quantidade + "x " : "") + d.produto : "";
+        $('[data-f="atual"]', r).textContent = d.problema ? d.problema.label : d.atual;
+        $('[data-f="proximo"]', r).textContent = d.proximo ? "Próxima etapa: " + d.proximo : "";
+        $('[data-f="ultima"]', r).textContent = d.ultimaAtualizacao ? "Última atualização: " + fmt(d.ultimaAtualizacao) : "";
+
+        const pb = $('[data-f="problema"]', r);
+        if (d.problema) { pb.textContent = d.problema.descricao; pb.classList.remove("hidden"); } else pb.classList.add("hidden");
+
+        const rs = $('[data-f="rastreio"]', r);
+        if (d.rastreio) {
+          rs.innerHTML = '<p class="text-black/55 text-xs uppercase tracking-wider">Código de rastreio' + (d.rastreio.transportadora ? " — " + esc(d.rastreio.transportadora) : "") + '</p>' +
+            '<p class="font-mono font-bold text-base mt-0.5">' + esc(d.rastreio.codigo) + '</p>' +
+            (d.rastreio.url ? '<a class="inline-block mt-1 underline font-semibold" rel="noopener" target="_blank" href="' + esc(d.rastreio.url) + '">Ver no site da transportadora</a>' : "");
+          rs.classList.remove("hidden");
+        } else rs.classList.add("hidden");
+
+        const cor = { feito: "bg-[var(--ink)]", atual: "bg-[var(--accent)] ring-4 ring-[var(--accent)]/30", proximo: "bg-white border-2 border-[var(--ink)]", futuro: "bg-white border-2 border-black/20" };
+        const tag = { atual: '<span class="ml-2 text-[10px] font-extrabold uppercase bg-[var(--accent)] text-[var(--accent-ink)] rounded px-1.5 py-0.5">agora</span>', proximo: '<span class="ml-2 text-[10px] font-bold uppercase text-black/50">próxima</span>' };
+        $('[data-f="passos"]', r).innerHTML = d.passos.map((p) =>
+          '<li class="mb-6 ml-6">' +
+            '<span class="absolute -left-[9px] mt-1 w-4 h-4 rounded-full ' + cor[p.estado] + '"></span>' +
+            '<p class="font-bold ' + (p.estado === "futuro" ? "text-black/40" : "") + '">' + esc(p.label) + (tag[p.estado] || "") + '</p>' +
+            '<p class="text-sm ' + (p.estado === "futuro" ? "text-black/35" : "text-black/65") + '">' + esc(p.descricao) + '</p>' +
+            (p.em ? '<p class="text-xs text-black/50 mt-0.5">' + fmt(p.em) + '</p>' : "") +
+          '</li>').join("");
+
+        r.classList.remove("hidden");
+        $("#carregando").classList.add("hidden");
+      }
+
+      async function porLink() {
+        try {
+          const resp = await fetch("/api/rastreio?codigo=" + encodeURIComponent(codigo) + "&t=" + encodeURIComponent(t), { cache: "no-store" });
+          const d = await resp.json();
+          if (!resp.ok) throw new Error(d.error || "Não foi possível carregar.");
+          mostrar(d);
+        } catch (e) {
+          $("#carregando").classList.add("hidden");
+          $("#form-wrap").classList.remove("hidden");
+          const er = $("[data-erro]"); er.textContent = e.message; er.classList.remove("hidden");
+        }
+      }
+      if (codigo && t) porLink();
+
+      $("#rastreio-form").addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const f = ev.currentTarget, b = f.querySelector("button"), er = $("[data-erro]");
+        er.classList.add("hidden"); b.disabled = true; b.textContent = "Buscando…";
+        try {
+          const fd = new FormData(f);
+          const resp = await fetch("/api/rastreio", { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ orderId: fd.get("orderId"), email: fd.get("email") }) });
+          const d = await resp.json();
+          if (!resp.ok) throw new Error(d.error || "Não foi possível buscar o pedido.");
+          $("#form-wrap").classList.add("hidden");
+          mostrar(d);
+        } catch (e) {
+          er.textContent = e.message; er.classList.remove("hidden");
+        } finally { b.disabled = false; b.textContent = "Ver meu pedido"; }
+      });
+    </script>
+    <!-- Chat de atendimento (public/chat.js). Aberto pelo link assinado do
+         e-mail, ele já sabe qual é o pedido (lê ?codigo=&t=). -->
+    <script is:inline src="/chat.js" data-api="/api/atendimento" data-baixo="20" defer></script>
+  </body>
+</html>

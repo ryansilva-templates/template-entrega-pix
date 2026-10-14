@@ -1,0 +1,118 @@
+---
+import "../../styles/global.css";
+import { isValidAdminSession, ADMIN_COOKIE } from "../../lib/admin-auth";
+import { SITE } from "../../config/site.config";
+import { ultimosRegistros, resumoFila } from "../../lib/recuperacao";
+import { relatorio } from "../../lib/atendimento";
+
+export const prerender = false;
+
+const token = Astro.cookies.get(ADMIN_COOKIE)?.value;
+if (!(await isValidAdminSession(token))) return Astro.redirect("/admin/login");
+
+const [fila, rec, chat] = await Promise.all([resumoFila(), ultimosRegistros(80), relatorio()]);
+const dataHora = (ms: number) =>
+  new Date(ms).toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+const corAcao: Record<string, string> = { enviada: "bg-green-100 text-green-900", cancelada: "bg-gray-100 text-gray-800", analise: "bg-amber-100 text-amber-900", adiada: "bg-blue-50 text-blue-900", agendada: "bg-[var(--blush)] text-[var(--ink)]", erro: "bg-red-100 text-red-900" };
+---
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><meta name="robots" content="noindex" />
+  <title>Atendimento · {SITE.storeName}</title>
+</head>
+<body class="bg-[var(--cream)] text-[var(--ink)] min-h-screen">
+  <header class="bg-[var(--ink)] text-white">
+    <div class="max-w-5xl mx-auto px-4 py-4 flex items-center gap-4 flex-wrap">
+      <b class="text-lg">{SITE.storeName} · Atendimento</b>
+      <a href="/admin" class="text-sm underline opacity-90">← Pedidos</a>
+    </div>
+  </header>
+
+  <main class="max-w-5xl mx-auto px-4 py-6 space-y-8">
+
+    <section class="bg-white rounded-xl border p-5">
+      <h2 class="text-lg font-bold mb-1">Testar o chat</h2>
+      <p class="text-sm text-gray-600 mb-3">Escreva como uma cliente escreveria. A resposta vem da mesma rota do balão do site (e entra no relatório).</p>
+      <form id="sim" class="flex gap-2 flex-wrap">
+        <input name="t" class="flex-1 min-w-[220px] border rounded-lg px-3 py-2" placeholder='ex.: "fiz o pix e nada", "qto sai o kit?"' maxlength="500" />
+        <button class="bg-[var(--accent)] text-white font-bold rounded-lg px-4 py-2">Enviar</button>
+      </form>
+      <pre id="simr" class="mt-3 whitespace-pre-wrap text-sm bg-[var(--cream)] rounded-lg p-3 hidden"></pre>
+    </section>
+
+    <section class="bg-white rounded-xl border p-5">
+      <h2 class="text-lg font-bold mb-1">Recuperação de venda (e-mail 1 h depois do Pix)</h2>
+      <p class="text-sm text-gray-600 mb-3">Na fila: <b>{fila.total}</b> · já vencidos aguardando a próxima rodada: <b>{fila.vencidos}</b></p>
+      {rec.length === 0 ? <p class="text-sm text-gray-500">Nenhum registro ainda.</p> : (
+        <div class="overflow-x-auto"><table class="w-full text-sm">
+          <thead><tr class="text-left text-gray-500"><th class="py-1 pr-3">Quando</th><th class="pr-3">Pedido</th><th class="pr-3">O que aconteceu</th><th>Motivo / status consultado</th></tr></thead>
+          <tbody>
+            {rec.map((r: any) => (
+              <tr class="border-t align-top">
+                <td class="py-1.5 pr-3 whitespace-nowrap">{dataHora(r.em)}</td>
+                <td class="pr-3 font-mono text-xs">{r.orderId}</td>
+                <td class="pr-3"><span class={`rounded px-2 py-0.5 text-xs font-bold ${corAcao[r.acao] ?? ""}`}>{r.acao}</span></td>
+                <td class="text-xs">{r.motivo ?? ""}{r.statusConsultado ? ` · ${r.statusConsultado}` : ""}{r.venceEm ? ` · vence ${dataHora(r.venceEm)}` : ""}{r.para ? ` · para ${r.para}` : ""}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div>
+      )}
+    </section>
+
+    <section class="grid md:grid-cols-2 gap-6">
+      <div class="bg-white rounded-xl border p-5">
+        <h2 class="text-lg font-bold mb-3">Dúvidas mais frequentes no chat</h2>
+        {chat.ranking.length === 0 ? <p class="text-sm text-gray-500">Nenhuma conversa ainda.</p> : (
+          <ol class="text-sm space-y-1">{chat.ranking.slice(0, 20).map((x) => <li class="flex justify-between gap-3"><span>{x.intencao}</span><b>{x.n}</b></li>)}</ol>
+        )}
+      </div>
+      <div class="bg-white rounded-xl border p-5">
+        <h2 class="text-lg font-bold mb-1">Perguntas que o chat NÃO soube responder</h2>
+        <p class="text-xs text-gray-500 mb-3">Viram entrada nova na base (src/data/conhecimento.ts) depois de revisadas — o chat nunca aprende sozinho.</p>
+        {chat.desconhecidas.length === 0 ? <p class="text-sm text-gray-500">Nenhuma.</p> : (
+          <ul class="text-sm space-y-1.5">{chat.desconhecidas.slice(0, 40).map((x: any) => <li><span class="text-gray-500 text-xs">{dataHora(x.em)}</span> — {x.texto}</li>)}</ul>
+        )}
+      </div>
+    </section>
+
+    <section class="bg-white rounded-xl border p-5">
+      <h2 class="text-lg font-bold mb-1">Precisa de atendimento humano</h2>
+      <p class="text-xs text-gray-500 mb-3">Cancelamentos, pagamento não identificado, defeito, troca, endereço… O cliente recebeu o link do WhatsApp {SITE.whatsappLoja}.</p>
+      {chat.humano.length === 0 ? <p class="text-sm text-gray-500">Nada pendente.</p> : (
+        <ul class="text-sm space-y-1.5">{chat.humano.slice(0, 40).map((x: any) => <li><span class="text-gray-500 text-xs">{dataHora(x.em)}</span> · <b>{x.intencao}</b>{x.orderId ? <span class="font-mono text-xs"> · {x.orderId}</span> : ""} — {x.texto}</li>)}</ul>
+      )}
+    </section>
+
+    <section class="bg-white rounded-xl border p-5">
+      <h2 class="text-lg font-bold mb-1">Não contatar</h2>
+      <p class="text-sm text-gray-600 mb-3">Registra (ou remove) a preferência de não receber lembretes. Os e-mails de entrega de pedido pago continuam.</p>
+      <form id="opt" class="flex gap-2 flex-wrap">
+        <input name="email" class="flex-1 min-w-[200px] border rounded-lg px-3 py-2" placeholder="e-mail" />
+        <input name="telefone" class="w-48 border rounded-lg px-3 py-2" placeholder="telefone com DDD" />
+        <select name="acao" class="border rounded-lg px-3 py-2"><option value="bloquear">Não contatar</option><option value="liberar">Liberar contato</option></select>
+        <button class="bg-[var(--ink)] text-white font-bold rounded-lg px-4 py-2">Salvar</button>
+      </form>
+      <p id="optr" class="text-sm mt-2"></p>
+    </section>
+  </main>
+
+  <script is:inline>
+    document.getElementById("sim").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const t = e.target.t.value.trim(); if (!t) return;
+      const out = document.getElementById("simr"); out.classList.remove("hidden"); out.textContent = "…";
+      const r = await fetch("/api/atendimento", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ texto: t, contexto: window.__ctx || {} }) });
+      const j = await r.json(); window.__ctx = j.contexto || {};
+      out.textContent = `Intenção: ${j.intencao}${j.humano ? "  (avisa humano)" : ""}\n\n${j.resposta || j.error}`;
+    });
+    document.getElementById("opt").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const r = await fetch("/api/admin/optout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: f.email.value, telefone: f.telefone.value, acao: f.acao.value }) });
+      const j = await r.json();
+      document.getElementById("optr").textContent = j.ok ? (f.acao.value === "bloquear" ? "Registrado: não contatar." : "Contato liberado.") : (j.error || "Erro.");
+    });
+  </script>
+</body>
+</html>

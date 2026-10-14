@@ -1,0 +1,6 @@
+---
+import { SITE } from "../config/site.config";
+export const prerender = false;
+// Este projeto não tem vitrine: quem cai na raiz vai para a loja.
+return Astro.redirect(SITE.storeUrl, 302);
+---
